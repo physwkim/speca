@@ -81,16 +81,16 @@ class SpecClient:
                     'put' : self.startall}
 
         # PV list
-        self.pvdb = {spec['name'] : PVSpec(put=self.motor_put, **spec).create(group=None, )
+        self.pvdb = {self.prefix + spec['name'] : PVSpec(put=self.motor_put, **spec).create(group=None, )
                      for spec in pvspec}
 
         # Customize abort behavior
         for spec in self.pvspec:
-            name = spec['name']
+            name = self.prefix + spec['name']
             self.pvdb[name].field_inst.stop.putter = self.abortall
 
-        self.pvdb['prestart'] = PVSpec(**prestart).create(group=None, )
-        self.pvdb['startall'] = PVSpec(**startall).create(group=None, )
+        self.pvdb[self.prefix + 'prestart'] = PVSpec(**prestart).create(group=None, )
+        self.pvdb[self.prefix + 'startall'] = PVSpec(**startall).create(group=None, )
 
         # EPICS IOC tasks
         self.server_tasks = _TaskHandler()
@@ -111,8 +111,11 @@ class SpecClient:
 
     async def epics_ioc_loop(self):
         """run epics IOC"""
+        pvdb = {
+            self.prefix + name : data for name, data in self.pvdb.items()
+        }
         ctx = Context(self.pvdb, None)
-        return await ctx.run(log_pv_names=False, startup_hook=None)
+        return await ctx.run(log_pv_names=True, startup_hook=None)
 
     async def subscribe(self, name, dtype='motor'):
         if dtype == 'motor':
@@ -244,6 +247,7 @@ class SpecClient:
             await instance.write(0)
 
     async def move(self, motor, value):
+        # print("in motor : {}".format(motor))
         await self.send('motor/{}/start_one'.format(motor),
                         str(value),
                         SpecCommand.SV_CHAN_SEND)
@@ -277,8 +281,9 @@ class SpecClient:
     async def process(self, header, data):
         cmd_type, motorName, prop = header.name.split('/')
 
+        # print("cmd_type : {}, motorName : {}, prop : {}".format(cmd_type, motorName, prop))
         if cmd_type == 'motor':
-            inst = self.pvdb[motorName]
+            inst = self.pvdb[self.prefix + motorName]
             # print("inst : {}, format(inst) : {}".format(inst, type(inst)))
             value = float(data)
 
@@ -331,6 +336,6 @@ if __name__ == '__main__':
 
     pvspec = [tth, th, chi, phi]
 
-    conn = SpecClient(pvspec, addr='192.168.122.23', port=6510)
+    conn = SpecClient(pvspec, addr='192.168.122.23', port=6510, prefix='spec:')
     loop = asyncio.get_event_loop()
     loop.run_until_complete(conn.run())
