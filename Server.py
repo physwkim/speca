@@ -1,101 +1,68 @@
 import time
 import asyncio
 import struct
-from collections import namedtuple
-from enum import IntEnum
+import logging
 
 from caproto.server import PVSpec
 from caproto.asyncio.utils import _TaskHandler
 from caproto.asyncio.server import Context
 
+from Spec import SpecCommand
+from Spec import SpecDataType
+from Spec import Header
+from Spec import Motor
 
-class SpecCommand(IntEnum):
-    SV_CLOSE = 1  # From Client
-    SV_ABORT = 2  # From Client
-    SV_CMD = 3    # From Client
-    SV_CMD_WITH_RETURN = 4 # From Client
-    SV_RETURN = 5 # Not yet used
-    SV_REGISTER = 6 # From Client
-    SV_UNREGISTER = 7 # From Client
-    SV_EVENT = 8 # From Server
-    SV_FUNC = 9 # From Client
-    SV_FUNC_WITH_RETURN = 10 # From Client
-    SV_CHAN_READ = 11 # From Client
-    SV_CHAN_SEND = 12 # From Client
-    SV_REPLY = 13 # From Server
-    SV_HELLO = 14 # From Client
-    SV_REPLY_REPLY = 15 # From Server
-
-class SpecDataType(IntEnum):
-    SV_DOUBLE = 1
-    SV_STRING = 2
-    SV_ERROR = 3
-    SV_ASSOC = 4
-    SV_ARR_DOUBLE = 5
-    SV_ARR_FLOAT = 6
-    SV_ARR_LONG = 7
-    SV_ARR_ULONG = 8
-    SV_ARR_SHORT = 9
-    SV_ARR_USHORT = 10
-    SV_ARR_CHAR = 11
-    SV_ARR_UCHAR = 12
-    SV_ARR_STRING = 13
-    SV_ARR_LONG64 = 14
-    SV_ARR_ULONG64 = 15
-
-# Spec Header Structure
-Header = namedtuple('Header', ['magic', 'vers', 'size', 'sn', 'sec',
-                               'usec', 'cmd', 'type', 'rows', 'cols',
-                               'len', 'err', 'flags', 'name'])
-
-# Motor structure
-Motor = namedtuple('Motor',
-                   ['position', 'move_done', 'low_limit',
-                    'high_limit', 'low_lim_hit', 'high_lim_hit'],
-                   defaults=[0, 0, 0, 0, 0, 0])
+logger = logging.getLogger(__name__)
 
 class SpecClient:
+    """
+        Converts motors and counters provided by SPEC in server mode to EPICS PV
+
+        Attributes
+        ----------
+        pvspec : list
+            information of motor defined as mne in SPEC
+        prefix : string
+            prefix is placed before the name of the PV to be created
+        addr   : string
+            IP address or hostname where server mode is running
+        port   : int
+            port number where server mode is running
+    """
     SV_SPEC_MAGIC = 4277009102
     SV_NAME_LEN = 80
     SV_VERSION = 4
 
     def __init__(self, pvspec, *args, **kwargs):
-        self.prefix = kwargs.get('prefix', '')
-
-        self.addr = kwargs.get('addr', '192.168.122.23')
-        self.port = kwargs.get('port', 6510)
+        self.lock = asyncio.Lock()
 
         self.motors = []
         self.scalers = []
 
         self.pvspec = pvspec
+        self.prefix = kwargs.get('prefix', '')
+        self.addr = kwargs.get('addr', '192.168.122.23')
+        self.port = kwargs.get('port', 6510)
 
-        prestart = {'name' : 'prestart',
-                    'value' : 0,
-                    'record' : 'ai',
-                    'put' : self.prestart}
-
-        startall = {'name' : 'startall',
-                    'value' : 0,
-                    'record' : 'ai',
-                    'put' : self.startall}
-
-        # PV list
+        # Make PV list
         self.pvdb = {self.prefix + spec['name'] : PVSpec(put=self.motor_put, **spec).create(group=None, )
                      for spec in pvspec}
 
         # Customize abort behavior
         for spec in self.pvspec:
-            name = self.prefix + spec['name']
-            self.pvdb[name].field_inst.stop.putter = self.abortall
-
-        self.pvdb[self.prefix + 'prestart'] = PVSpec(**prestart).create(group=None, )
-        self.pvdb[self.prefix + 'startall'] = PVSpec(**startall).create(group=None, )
+            spec_name = spec['name']
+            if spec_name == 'prestart':
+                name = self.prefix + spec_name
+                self.pvdb[name].putter = self.prestart
+            elif spec_name == 'startall':
+                name = self.prefix + spec_name
+                self.pvdb[name].putter = self.start_all
+            elif spec['record'] == 'motor':
+                name = self.prefix + spec_name
+                self.pvdb[name].field_inst.stop.putter = self.abortall
 
         # EPICS IOC tasks
         self.server_tasks = _TaskHandler()
-
-        self.lock = asyncio.Lock()
 
         print("Caproto Server is running!")
         print("PVs: {}".format([self.prefix + spec.name for _, spec in self.pvdb.items()]))
@@ -106,7 +73,7 @@ class SpecClient:
 
     async def motor_put(self, instance, value):
         if value != instance.field_inst.user_readback_value.value:
-            print("motor : {}, moving to : {}".format(instance.name, value))
+            logger.info("motor : {}, moving to : {}".format(instance.name, value))
             await self.move(instance.name, value)
 
     async def epics_ioc_loop(self):
@@ -162,11 +129,9 @@ class SpecClient:
 
     async def unsubscribe_all(self):
         for name in self.motors:
-            # print("name : {}".format(name))
             await self.unsubscribe(name, dtype='motor')
 
         for name in self.scalers:
-            # print("name : {}".format(name))
             await self.unsubscribe(name, dtype='scaler')
 
     async def recv(self):
@@ -195,21 +160,24 @@ class SpecClient:
         return header, data
 
     def encode(self, name, msg, cmd_type=SpecCommand.SV_CMD):
+        # packet header structure
+        # https://certif.com/spec_help/server.html
         header = struct.pack("IiIIIIiiIIIii80s",
-                             self.SV_SPEC_MAGIC, # SV_SPEC_MAGIC
-                             self.SV_VERSION, # Protocol version number
-                             132,  # Size of the structure
-                             1234, # Serial number (client's choice)
-                             int(time.time()), # Time when sent (seconds)
-                             int(time.time()*(10**6)) & 2**32-1, # time when sent (microseconds)
-                             cmd_type, # Command code
-                             2, # Type of data
-                             0, # Number of rows if array data
-                             0, # Number of columns if array data
-                             len(msg), # Bytes of data that follow
-                             0, # Error code
-                             0, # Flags
-                             name.encode("ascii")) # Name of property
+                             self.SV_SPEC_MAGIC,                 # SV_SPEC_MAGIC
+                             self.SV_VERSION,                    # Protocol version number
+                             132,                                # Size of the structure
+                             1234,                               # Serial number (client's choice)
+                             int(time.time()),                   # Time when sent (seconds)
+                             int(time.time()*(10**6)) & 2**32-1, # Time when sent (microseconds)
+                             cmd_type,                           # Command code
+                             2,                                  # Type of data
+                             0,                                  # Number of rows if array data
+                             0,                                  # Number of cols if array data
+                             len(msg),                           # Bytes of data that follow
+                             0,                                  # Error code
+                             0,                                  # Flags
+                             name.encode("ascii"))               # Name of property
+
         data = header  + msg.encode()
         return data
 
@@ -219,39 +187,6 @@ class SpecClient:
         header = header._replace(name=header.name.decode('utf-8').rstrip('\x00'))
         return header
 
-    async def prestart(self, instance, value):
-        if value > 0:
-            await self.send('motor/../prestart_all',
-                            '',
-                            SpecCommand.SV_CHAN_SEND)
-
-            # set to 0
-            await instance.write(0)
-
-    async def startall(self, instance, value):
-        if value > 0:
-            await self.send('motor/../start_all',
-                            '',
-                            SpecCommand.SV_CHAN_SEND)
-
-            # set to 0
-            await instance.write(0)
-
-    async def abortall(self, instance, value):
-        if value > 0:
-            await self.send('motor/../abort_all',
-                            '',
-                            SpecCommand.SV_CHAN_SEND)
-
-            # set to 0
-            await instance.write(0)
-
-    async def move(self, motor, value):
-        # print("in motor : {}".format(motor))
-        await self.send('motor/{}/start_one'.format(motor),
-                        str(value),
-                        SpecCommand.SV_CHAN_SEND)
-
     async def send(self, name, msg, cmd_type=SpecCommand.SV_CMD):
         data = self.encode(name, msg, cmd_type)
 
@@ -259,32 +194,36 @@ class SpecClient:
             self.writer.write(data)
             await self.writer.drain()
 
-    async def run(self):
-        # make ioc
-        self.server_tasks.create(self.epics_ioc_loop())
-        self.reader, self.writer = await asyncio.open_connection(self.addr, self.port)
+    async def prestart(self, instance, value):
+        if value > 0:
+            await self.send('motor/../prestart_all',
+                            '',
+                            SpecCommand.SV_CHAN_SEND)
 
-        # subscribe to spec
-        await self.subs()
+    async def start_all(self, instance, value):
+        if value > 0:
+            await self.send('motor/../start_all',
+                            '',
+                            SpecCommand.SV_CHAN_SEND)
 
-        while True:
-            try:
-                header, data = await self.recv()
-                if header:
-                    # print("name : {}, data : {}".format(header.name, data))
-                    await self.process(header, data)
-            except KeyboardInterrupt:
-                break
-            except:
-                continue
+    async def abortall(self, instance, value):
+        if value > 0:
+            await self.send('motor/../abort_all',
+                            '',
+                            SpecCommand.SV_CHAN_SEND)
+
+    async def move(self, motor, value):
+        await self.send('motor/{}/start_one'.format(motor),
+                        str(value),
+                        SpecCommand.SV_CHAN_SEND)
 
     async def process(self, header, data):
         cmd_type, motorName, prop = header.name.split('/')
 
-        # print("cmd_type : {}, motorName : {}, prop : {}".format(cmd_type, motorName, prop))
+        logger.debug("cmd_type : {}, motorName : {}, prop : {}".format(cmd_type, motorName, prop))
         if cmd_type == 'motor':
             inst = self.pvdb[self.prefix + motorName]
-            # print("inst : {}, format(inst) : {}".format(inst, type(inst)))
+            logger.debug("inst : {}, format(inst) : {}".format(inst, type(inst)))
             value = float(data)
 
             if prop == 'position':
@@ -313,7 +252,29 @@ class SpecClient:
                 value  = bool(int(value))
                 await inst.field_inst.user_high_lmit_switch.write(value)
 
+    async def run(self):
+        # make EPICS ioc
+        self.server_tasks.create(self.epics_ioc_loop())
+
+        # make connection to spec server
+        self.reader, self.writer = await asyncio.open_connection(self.addr, self.port)
+
+        # subscribe motors
+        await self.subs()
+
+        while True:
+            try:
+                header, data = await self.recv()
+                if header:
+                    await self.process(header, data)
+            except KeyboardInterrupt:
+                break
+            except:
+                continue
+
+
 if __name__ == '__main__':
+    # SPEC motor spec
     tth = {'name' : 'tth',
            'value' : 0,
            'dtype' : float,
@@ -334,8 +295,19 @@ if __name__ == '__main__':
            'dtype' : float,
            'record' : 'motor'}
 
-    pvspec = [tth, th, chi, phi]
+    prestart = {'name' : 'prestart',
+                'value' : 0,
+                'dtype' : int,
+                'record' : 'ai'}
 
-    conn = SpecClient(pvspec, addr='192.168.122.23', port=6510, prefix='spec:')
+    startall = {'name' : 'startall',
+                'value' : 0,
+                'dtype' : int,
+                'record' : 'ai'}
+
+    pvspec = [prestart, startall, tth, th, chi, phi]
+
+    client = SpecClient(pvspec, addr='192.168.122.23', port=6510, prefix='spec:')
+
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(conn.run())
+    loop.run_until_complete(client.run())
