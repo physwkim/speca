@@ -68,10 +68,31 @@ class SpecClient:
         self.motors = []
         self.scalers = []
 
+        self.pvspec = pvspec
+
+        prestart = {'name' : 'prestart',
+                    'value' : 0,
+                    'record' : 'ai',
+                    'put' : self.prestart}
+
+        startall = {'name' : 'startall',
+                    'value' : 0,
+                    'record' : 'ai',
+                    'put' : self.startall}
+
         # PV list
-        self.pvdb = {spec['name'] : PVSpec(put=self.putter, **spec).create(group=None, )
+        self.pvdb = {spec['name'] : PVSpec(put=self.motor_put, **spec).create(group=None, )
                      for spec in pvspec}
 
+        # Customize abort behavior
+        for spec in self.pvspec:
+            name = spec['name']
+            self.pvdb[name].field_inst.stop.putter = self.abortall
+
+        self.pvdb['prestart'] = PVSpec(**prestart).create(group=None, )
+        self.pvdb['startall'] = PVSpec(**startall).create(group=None, )
+
+        # EPICS IOC tasks
         self.server_tasks = _TaskHandler()
 
         self.lock = asyncio.Lock()
@@ -79,9 +100,14 @@ class SpecClient:
         print("Caproto Server is running!")
         print("PVs: {}".format([self.prefix + spec.name for _, spec in self.pvdb.items()]))
 
-    async def putter(self, instance, value):
-        print("motor : {}, moving to : {}".format(instance.name, value))
-        await self.move(instance.name, value)
+    async def subs(self):
+        for spec in self.pvspec:
+            await self.subscribe(spec['name'])
+
+    async def motor_put(self, instance, value):
+        if value != instance.field_inst.user_readback_value.value:
+            print("motor : {}, moving to : {}".format(instance.name, value))
+            await self.move(instance.name, value)
 
     async def epics_ioc_loop(self):
         """run epics IOC"""
@@ -190,20 +216,32 @@ class SpecClient:
         header = header._replace(name=header.name.decode('utf-8').rstrip('\x00'))
         return header
 
-    async def prestart(self):
-        await self.send('motor/../prestart_all',
-                        '',
-                        SpecCommand.SV_CHAN_SEND)
+    async def prestart(self, instance, value):
+        if value > 0:
+            await self.send('motor/../prestart_all',
+                            '',
+                            SpecCommand.SV_CHAN_SEND)
 
-    async def startall(self):
-        await self.send('motor/../start_all',
-                        '',
-                        SpecCommand.SV_CHAN_SEND)
+            # set to 0
+            await instance.write(0)
 
-    async def abortall(self):
-        await self.send('motor/../abort_all',
-                        '',
-                        SpecCommand.SV_CHAN_SEND)
+    async def startall(self, instance, value):
+        if value > 0:
+            await self.send('motor/../start_all',
+                            '',
+                            SpecCommand.SV_CHAN_SEND)
+
+            # set to 0
+            await instance.write(0)
+
+    async def abortall(self, instance, value):
+        if value > 0:
+            await self.send('motor/../abort_all',
+                            '',
+                            SpecCommand.SV_CHAN_SEND)
+
+            # set to 0
+            await instance.write(0)
 
     async def move(self, motor, value):
         await self.send('motor/{}/start_one'.format(motor),
@@ -222,8 +260,8 @@ class SpecClient:
         self.server_tasks.create(self.epics_ioc_loop())
         self.reader, self.writer = await asyncio.open_connection(self.addr, self.port)
 
-        await self.subscribe('tth')
-        await self.subscribe('th')
+        # subscribe to spec
+        await self.subs()
 
         while True:
             try:
@@ -273,18 +311,22 @@ class SpecClient:
 if __name__ == '__main__':
     tth = {'name' : 'tth',
            'value' : 0,
+           'dtype' : float,
            'record' : 'motor'}
 
     th = {'name' : 'th',
-           'value' : 0,
+          'value' : 0,
+          'dtype' : float,
           'record' : 'motor'}
 
     chi = {'name' : 'chi',
            'value' : 0,
-          'record' : 'motor'}
+           'dtype' : float,
+           'record' : 'motor'}
 
     phi = {'name' : 'phi',
            'value' : 0,
+           'dtype' : float,
            'record' : 'motor'}
 
     pvspec = [tth, th, chi, phi]
