@@ -7,12 +7,10 @@ from caproto.server import PVSpec
 from caproto.asyncio.utils import _TaskHandler
 from caproto.asyncio.server import Context
 
-from Spec import SpecCommand
-from Spec import SpecDataType
-from Spec import Header
-from Spec import Motor
+from Spec import SpecCommand, SpecDataType, Header, Motor
 
 logger = logging.getLogger(__name__)
+
 
 class SpecClient:
     """
@@ -20,8 +18,8 @@ class SpecClient:
 
         Attributes
         ----------
-        pvspec : list
-            information of motor defined as mne in SPEC
+        pvspec : dict
+            information of motor, scaler, pure PV defined as mnemonic in SPEC
         prefix : string
             prefix is placed before the name of the PV to be created
         addr   : string
@@ -38,6 +36,8 @@ class SpecClient:
 
         self.motors = []
         self.scalers = []
+        self.pvs = []
+        self.pvdb = {}
 
         self.pvspec = pvspec
         self.prefix = kwargs.get('prefix', '')
@@ -45,21 +45,30 @@ class SpecClient:
         self.port = kwargs.get('port', 6510)
 
         # Make PV list
-        self.pvdb = {self.prefix + spec['name'] : PVSpec(put=self.motor_put, **spec).create(group=None, )
-                     for spec in pvspec}
+        for key, pvspec in self.pvspec.items():
+            if key == 'motor':
+                for spec in pvspec:
+                    chan = PVSpec(put=self.motor_put, **spec).create(group=None,)
+                    chan.field_inst.stop.putter = self.abortall
+                    self.pvdb[self.prefix + spec['name']] = chan
 
-        # Customize abort behavior
-        for spec in self.pvspec:
-            spec_name = spec['name']
-            if spec_name == 'prestart':
-                name = self.prefix + spec_name
-                self.pvdb[name].putter = self.prestart
-            elif spec_name == 'startall':
-                name = self.prefix + spec_name
-                self.pvdb[name].putter = self.start_all
-            elif spec['record'] == 'motor':
-                name = self.prefix + spec_name
-                self.pvdb[name].field_inst.stop.putter = self.abortall
+            elif key == 'scaler':
+                for spec in pvspec:
+                    self.pvdb[self.prefix + spec['name']] = PVSpec(**spec).create(group=None,)
+
+            elif key == 'pv':
+                for spec in pvspec:
+                    spec_name = spec['name']
+                    chan = PVSpec(**spec).create(group=None,)
+
+                    if spec_name == 'prestart':
+                        chan.putter = self.prestart
+                    elif spec_name == 'startall':
+                        chan.putter = self.start_all
+                    elif spec_name == 'count':
+                        chan.putter = self.count
+
+                    self.pvdb[self.prefix + spec_name] = chan
 
         # EPICS IOC tasks
         self.server_tasks = _TaskHandler()
@@ -67,9 +76,37 @@ class SpecClient:
         print("Caproto Server is running!")
         print("PVs: {}".format([self.prefix + spec.name for _, spec in self.pvdb.items()]))
 
+    async def subscribe(self, name, dtype='motor'):
+        if dtype == 'motor':
+            if name not in self.motors:
+                self.motors.append(name)
+
+                for prop in Motor._fields:
+                    await self.send('motor/{name}/{prop}'.format(name=name, prop=prop),
+                                    '',
+                                    cmd_type=SpecCommand.SV_REGISTER)
+
+        elif dtype == 'scaler':
+            if name not in self.scalers:
+                self.scalers.append(name)
+
+                await self.send('scaler/{name}/value'.format(name=name),
+                                '',
+                                cmd_type=SpecCommand.SV_REGISTER)
+
+        elif dtype == 'pv':
+            if name == 'count':
+                self.pvs.append(name)
+
+                await self.send('scaler/.all./count',
+                                '',
+                                cmd_type=SpecCommand.SV_REGISTER)
+
+
     async def subs(self):
-        for spec in self.pvspec:
-            await self.subscribe(spec['name'])
+        for dtype, pvspec in self.pvspec.items():
+            for spec in pvspec:
+                await self.subscribe(spec['name'], dtype=dtype)
 
     async def motor_put(self, instance, value):
         if value != instance.field_inst.user_readback_value.value:
@@ -83,31 +120,6 @@ class SpecClient:
         }
         ctx = Context(self.pvdb, None)
         return await ctx.run(log_pv_names=True, startup_hook=None)
-
-    async def subscribe(self, name, dtype='motor'):
-        if dtype == 'motor':
-            if name not in self.motors:
-                self.motors.append(name)
-
-                for prop in Motor._fields:
-                    await self.send('motor/{name}/{prop}'.format(name=name, prop=prop),
-                                    '',
-                                    cmd_type=SpecCommand.SV_REGISTER)
-
-        elif dtype == 'scaler':
-            if 'count' not in self.scalers:
-                self.scalers.append('count')
-
-                await self.send('scaler/.all./count',
-                                '',
-                                cmd_type=SpecCommand.SV_REGISTER)
-
-            if name not in self.scalers:
-                self.scalers.append(name)
-
-                await self.send('scaler/{name}/value'.format(name=name),
-                                '',
-                                cmd_type=SpecCommand.SV_REGISTER)
 
     async def unsubscribe(self, name, dtype='motor'):
         if dtype == 'motor':
@@ -217,12 +229,23 @@ class SpecClient:
                         str(value),
                         SpecCommand.SV_CHAN_SEND)
 
-    async def process(self, header, data):
-        cmd_type, motorName, prop = header.name.split('/')
+    async def count(self, instance, value):
+        name = instance.name
+        val = self.pvdb[self.prefix + 'preset'].value
 
-        logger.debug("cmd_type : {}, motorName : {}, prop : {}".format(cmd_type, motorName, prop))
+        was_counting = self.pvdb[self.prefix + 'count'].value
+        if was_counting == 0:
+            await self.send('scaler/.all./count',
+                            str(val),
+                            SpecCommand.SV_CHAN_SEND)
+
+    async def process(self, header, data):
+        cmd_type, mnemonic, prop = header.name.split('/')
+        mnemonic = mnemonic.strip('.')
+
+        logger.debug("cmd_type : {}, mnemonic : {}, prop : {}, data : {}".format(cmd_type, mnemonic, prop, data))
         if cmd_type == 'motor':
-            inst = self.pvdb[self.prefix + motorName]
+            inst = self.pvdb[self.prefix + mnemonic]
             logger.debug("inst : {}, format(inst) : {}".format(inst, type(inst)))
             value = float(data)
 
@@ -251,6 +274,14 @@ class SpecClient:
             elif prop == 'high_limit_hit':
                 value  = bool(int(value))
                 await inst.field_inst.user_high_lmit_switch.write(value)
+
+        if cmd_type == 'scaler':
+            if mnemonic == 'all':
+                mnemonic = prop
+
+            inst = self.pvdb[self.prefix + mnemonic]
+            value = int(data) if mnemonic == 'count' else float(data)
+            await inst.write(value)
 
     async def run(self):
         # make EPICS ioc
@@ -305,7 +336,37 @@ if __name__ == '__main__':
                 'dtype' : int,
                 'record' : 'ai'}
 
-    pvspec = [prestart, startall, tth, th, chi, phi]
+    # SPEC counter
+    preset = {'name' : 'preset',
+              'value' : 1.0,
+              'dtype' : float,
+              'record' : 'ai'}
+
+    count = {'name' : 'count',
+             'value' : -1,
+             'dtype' : int,
+             'record' : 'ai'}
+
+    sec = {'name' : 'sec',
+           'value' : 0,
+           'dtype' : float,
+           'record' : 'ai'}
+
+    mon = {'name' : 'mon',
+           'value' : 0,
+           'dtype' : float,
+           'record' : 'ai'}
+
+    det = {'name' : 'det',
+           'value' : 0,
+           'dtype' : float,
+           'record' : 'ai'}
+
+    pvspec = {
+              'motor'   : [tth, th, chi, phi],
+              'scaler' : [sec, mon, det],
+              'pv'    : [preset, count, prestart, startall]
+             }
 
     client = SpecClient(pvspec, addr='192.168.122.23', port=6510, prefix='spec:')
 
