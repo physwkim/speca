@@ -1,6 +1,8 @@
 from enum import IntEnum
 from collections import namedtuple
 
+__all__ = ['SpecCommand', 'SpecDataType', 'Header', 'Motor']
+
 class SpecCommand(IntEnum):
     """
         SPEC command code
