@@ -246,34 +246,42 @@ class SpecClient:
         logger.debug("cmd_type : {}, mnemonic : {}, prop : {}, data : {}".format(cmd_type, mnemonic, prop, data))
         if cmd_type == 'motor':
             inst = self.pvdb[self.prefix + mnemonic]
-            logger.debug("inst : {}, format(inst) : {}".format(inst, type(inst)))
             value = float(data)
 
             if prop == 'position':
-                await inst.field_inst.user_readback_value.write(value)
-                await inst.field_inst.user_readback_value.write(value)
-                await inst.field_inst.raw_readback_value.write(value)
+                if value != inst.field_inst.user_readback_value.value:
+                    await inst.field_inst.user_readback_value.write(value)
+                    await inst.field_inst.dial_readback_value.write(value)
+                    await inst.field_inst.raw_readback_value.write(value)
 
             elif prop == 'move_done':
                 moving_done = not bool(int(value))
-                await inst.field_inst.done_moving_to_value.write(moving_done)
-                await inst.field_inst.motor_is_moving.write(not moving_done)
+
+                if moving_done != inst.field_inst.done_moving_to_value.value:
+                    await inst.field_inst.done_moving_to_value.write(moving_done)
+                if (not moving_done) != inst.field_inst.motor_is_moving.value:
+                    await inst.field_inst.motor_is_moving.write(not moving_done)
+
 
             elif prop == 'low_limit':
                 value  = bool(int(value))
-                await inst.field_inst.user_low_limit.write(value)
+                if value != inst.field_inst.user_low_limit.value:
+                    await inst.field_inst.user_low_limit.write(value)
 
             elif prop == 'high_limit':
                 value  = bool(int(value))
-                await inst.field_inst.user_high_limit.write(value)
+                if value != inst.field_inst.user_high_limit.value:
+                    await inst.field_inst.user_high_limit.write(value)
 
             elif prop == 'low_limit_hit':
                 value  = bool(int(value))
-                await inst.field_inst.user_low_lmit_switch.write(value)
+                if value != inst.field_inst.user_low_limit_switch.value:
+                    await inst.field_inst.user_low_limit_switch.write(value)
 
             elif prop == 'high_limit_hit':
                 value  = bool(int(value))
-                await inst.field_inst.user_high_lmit_switch.write(value)
+                if value != inst.field_inst.user_high_limit_switch.value:
+                    await inst.field_inst.user_high_limit_switch.write(value)
 
         if cmd_type == 'scaler':
             if mnemonic == 'all':
@@ -281,7 +289,9 @@ class SpecClient:
 
             inst = self.pvdb[self.prefix + mnemonic]
             value = int(data) if mnemonic == 'count' else float(data)
-            await inst.write(value)
+
+            if value != inst.value:
+                await inst.write(value)
 
     async def run(self):
         # make EPICS ioc
@@ -337,10 +347,10 @@ if __name__ == '__main__':
                 'record' : 'ai'}
 
     # SPEC counter
-    preset = {'name' : 'preset',
-              'value' : 1.0,
-              'dtype' : float,
-              'record' : 'ai'}
+    preset_time = {'name' : 'preset',
+                   'value' : 1.0,
+                   'dtype' : float,
+                   'record' : 'ai'}
 
     count = {'name' : 'count',
              'value' : -1,
@@ -365,7 +375,7 @@ if __name__ == '__main__':
     pvspec = {
               'motor'   : [tth, th, chi, phi],
               'scaler' : [sec, mon, det],
-              'pv'    : [preset, count, prestart, startall]
+              'pv'    : [preset_time, count, prestart, startall]
              }
 
     client = SpecClient(pvspec, addr='192.168.122.23', port=6510, prefix='spec:')
