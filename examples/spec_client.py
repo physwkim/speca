@@ -3,24 +3,24 @@ from speca.client import SpecClient
 
 # SPEC motor spec
 tth = {'name' : 'tth',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'motor'}
+       'value' : 0,
+       'dtype' : float,
+       'record' : 'motor'}
 
 th = {'name' : 'th',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'motor'}
+      'value' : 0,
+      'dtype' : float,
+      'record' : 'motor'}
 
 chi = {'name' : 'chi',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'motor'}
+       'value' : 0,
+       'dtype' : float,
+       'record' : 'motor'}
 
 phi = {'name' : 'phi',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'motor'}
+       'value' : 0,
+       'dtype' : float,
+       'record' : 'motor'}
 
 prestart = {'name' : 'prestart',
             'value' : 0,
@@ -34,29 +34,29 @@ startall = {'name' : 'startall',
 
 # SPEC counter
 preset_time = {'name' : 'preset',
-                'value' : 1.0,
-                'dtype' : float,
-                'record' : 'ai'}
+               'value' : 1.0,
+               'dtype' : float,
+               'record' : 'ai'}
 
 count = {'name' : 'count',
-            'value' : -1,
+            'value' : 0,
             'dtype' : int,
             'record' : 'ai'}
 
 sec = {'name' : 'sec',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'ai'}
+       'value' : 0,
+       'dtype' : float,
+       'record' : 'ai'}
 
 mon = {'name' : 'mon',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'ai'}
+       'value' : 0,
+       'dtype' : float,
+       'record' : 'ai'}
 
 det = {'name' : 'det',
-        'value' : 0,
-        'dtype' : float,
-        'record' : 'ai'}
+       'value' : 0,
+       'dtype' : float,
+       'record' : 'ai'}
 
 pvspec = {
             'motor'   : [tth, th, chi, phi],

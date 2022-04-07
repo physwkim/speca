@@ -5,6 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 install_requires = [
     'caproto>=0.8.1',
+    'numpy>=1.21.0',
 ]
 
 setuptools.setup(

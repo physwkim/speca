@@ -1,2 +1,2 @@
 from .client import *
-from .spec import *
+from .header import *

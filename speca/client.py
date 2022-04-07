@@ -3,15 +3,34 @@ import asyncio
 import struct
 import logging
 
+import numpy as np
+
 from caproto.server import PVSpec
 from caproto.asyncio.utils import _TaskHandler
 from caproto.asyncio.server import Context
 
-from .spec import SpecCommand, SpecDataType, Header, Motor
+from .header import SpecCommand, SpecDataType, Header, Motor
+
+__all__ = ['SpecClient']
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['SpecClient']
+async def set_precision(record, prec):
+    """
+        Update precision of all fields of given record
+
+        Parameters
+        ----------
+        record : caproto's record instance
+            epics record
+        prec   : int
+            precision of record and its sub field
+    """
+    await record.write_metadata(precision=prec)
+
+    for _, prop in record.field_inst.pvdb.items():
+        if hasattr(prop, 'precision'):
+            await prop.write_metadata(precision=prec)
 
 class SpecClient:
     """
@@ -27,6 +46,8 @@ class SpecClient:
             IP address or hostname where server mode is running
         port   : int
             port number where server mode is running
+        precision : int
+            default precision of records
     """
     SV_SPEC_MAGIC = 4277009102
     SV_NAME_LEN = 80
@@ -34,9 +55,12 @@ class SpecClient:
 
     def __init__(self, pvspec, *args, **kwargs):
         self.lock = asyncio.Lock()
+        self.flagLock = asyncio.Lock()
+        self._last_scaler_status = 0
 
         self.motors = []
         self.scalers = []
+        self.scaler_flags = []
         self.pvs = []
         self.pvdb = {}
 
@@ -44,6 +68,7 @@ class SpecClient:
         self.prefix = kwargs.get('prefix', '')
         self.addr = kwargs.get('addr', '192.168.122.23')
         self.port = kwargs.get('port', 6510)
+        self.precision = kwargs.get('precision', 3)
 
         # Make PV list
         for key, pvspec in self.pvspec.items():
@@ -56,6 +81,9 @@ class SpecClient:
             elif key == 'scaler':
                 for spec in pvspec:
                     self.pvdb[self.prefix + spec['name']] = PVSpec(**spec).create(group=None,)
+
+                    self.scalers.append(spec['name'])
+                self.scaler_flags = [0] * len(self.scalers)
 
             elif key == 'pv':
                 for spec in pvspec:
@@ -87,14 +115,6 @@ class SpecClient:
                                     '',
                                     cmd_type=SpecCommand.SV_REGISTER)
 
-        elif dtype == 'scaler':
-            if name not in self.scalers:
-                self.scalers.append(name)
-
-                await self.send('scaler/{name}/value'.format(name=name),
-                                '',
-                                cmd_type=SpecCommand.SV_REGISTER)
-
         elif dtype == 'pv':
             if name == 'count':
                 self.pvs.append(name)
@@ -112,6 +132,16 @@ class SpecClient:
         if value != instance.field_inst.user_readback_value.value:
             logger.info("motor : {}, moving to : {}".format(instance.name, value))
             await self.move(instance.name, value)
+
+        else:
+            # Need status transition for the same motor position
+            # set to moving
+            await instance.field_inst.done_moving_to_value.write(0)
+            await instance.field_inst.motor_is_moving.write(1)
+
+            # set to done
+            await instance.field_inst.done_moving_to_value.write(1)
+            await instance.field_inst.motor_is_moving.write(0)
 
     async def epics_ioc_loop(self):
         """run epics IOC"""
@@ -131,20 +161,19 @@ class SpecClient:
             if name in self.motors:
                 self.motors.remove(name)
 
-        elif dtype == 'scaler':
-            await self.send('scaler/{name}/value'.format(name=name),
-                            '',
-                            cmd_type=SpecCommand.SV_UNREGISTER)
+        elif dtype == 'pv':
+            if 'count' in self.pvs:
+                await self.send('scaler/.all./count',
+                                '',
+                                cmd_type=SpecCommand.SV_UNREGISTER)
 
-            if name in self.scalers:
-                self.scalers.remove(name)
+                self.pvs.remove('count')
 
     async def unsubscribe_all(self):
         for name in self.motors:
             await self.unsubscribe(name, dtype='motor')
 
-        for name in self.scalers:
-            await self.unsubscribe(name, dtype='scaler')
+        await self.unsubscribe(name, dtype='pv')
 
     async def recv(self):
         size = 132
@@ -232,12 +261,19 @@ class SpecClient:
     async def count(self, instance, value):
         name = instance.name
         val = self.pvdb[self.prefix + 'preset'].value
-
         was_counting = self.pvdb[self.prefix + 'count'].value
-        if was_counting == 0:
+
+        if was_counting == 0 and value > 0:
+            # Start counting
             await self.send('scaler/.all./count',
                             str(val),
                             SpecCommand.SV_CHAN_SEND)
+
+    async def update_scaler(self):
+        for scaler in self.scalers:
+            await self.send('scaler/{name}/value'.format(name=scaler),
+                            '',
+                            cmd_type=SpecCommand.SV_CHAN_READ)
 
     async def process(self, header, data):
         cmd_type, mnemonic, prop = header.name.split('/')
@@ -285,23 +321,64 @@ class SpecClient:
 
         if cmd_type == 'scaler':
             if mnemonic == 'all':
-                mnemonic = prop
+                inst = self.pvdb[self.prefix + 'count']
+                value = int(data)
+                if value == 0:
+                    was_counting = self._last_scaler_status
+                    if was_counting and not value:
+                        await self.update_scaler()
 
-            inst = self.pvdb[self.prefix + mnemonic]
-            value = int(data) if mnemonic == 'count' else float(data)
+                self._last_scaler_status = value
 
-            if value != inst.value:
-                await inst.write(value)
+            else:
+                inst = self.pvdb[self.prefix + mnemonic]
+                value = float(data)
+
+                idx = self.scalers.index(mnemonic)
+
+                if value != inst.value:
+                    await inst.write(value)
+
+                async with self.flagLock:
+                    self.scaler_flags[idx] = 1
+
+
+    async def _check_scaler(self):
+        """
+            When all scaler values have been updated, count PV and scaler flags
+            ara initialized to 0
+        """
+        while True:
+            if np.all(self.scaler_flags):
+                await self.pvdb[self.prefix + 'count'].write(0)
+
+                async with self.flagLock:
+                    self.scaler_flags = [0] * len(self.scalers)
+
+            else:
+                await asyncio.sleep(0.02)
+
+    async def _set_metadata(self):
+        """Set default precision of motor record"""
+        for name in self.motors + self.scalers:
+            record = self.pvdb[self.prefix + name]
+            await set_precision(record, self.precision)
 
     async def run(self):
         # make EPICS ioc
         self.server_tasks.create(self.epics_ioc_loop())
+
+        # check whether all scalers are updated
+        self.server_tasks.create(self._check_scaler())
 
         # make connection to SPEC server
         self.reader, self.writer = await asyncio.open_connection(self.addr, self.port)
 
         # subscribe devices
         await self.subs()
+
+        # set metadata
+        await self._set_metadata()
 
         while True:
             try:
