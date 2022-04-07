@@ -72,11 +72,11 @@ det = {'name' : 'det',
        'dtype' : float,
        'record' : 'ai'}
 
-# All specificatino
+# All specification
 pvspec = {
             'motor'   : [tth, th, chi, phi],
             'scaler' : [sec, mon, det],
-            'pv'    : [preset_time, count, prestart, startall]
+            'pv'    : [preset_time, count]
         }
 
 # Run client
